@@ -78,36 +78,225 @@ class DCSystemService(SettableService):
             self._local_values[path] = self.service[path]
         options = None  # currently not used afaik
         self.monitor = DbusMonitor({
-            'com.victronenergy.dcload': {
-                '/Dc/0/Current': options,
+            'com.victronenergy.battery': {
+                '/Dc/0/Power': options,
                 '/Dc/0/Voltage': options,
+                '/Dc/0/Current': options,
+            },
+            'com.victronenergy.vebus': {
+                '/Dc/0/Power': options,
+                '/Dc/0/Voltage': options,
+                '/Dc/0/Current': options,
+                '/Ac/Out/L1/P': options,
+                '/Ac/Out/L2/P': options,
+                '/Ac/Out/L3/P': options,
+            },
+            'com.victronenergy.solarcharger': {
+                '/Dc/0/Voltage': options,
+                '/Dc/0/Current': options,
+                '/Load/I': options,
+            },
+            'com.victronenergy.charger': {
+                '/Dc/0/Voltage': options,
+                '/Dc/0/Current': options,
+            },
+            'com.victronenergy.fuelcell': {
+                '/Dc/0/Voltage': options,
+                '/Dc/0/Current': options,
+            },
+            'com.victronenergy.alternator': {
+                '/Dc/0/Power': options,
+            },
+            'com.victronenergy.dcload': {
+                '/Dc/0/Power': options,
+                '/Dc/0/Voltage': options,
+                '/Dc/0/Current': options,
                 '/History/EnergyIn': options,
                 '/Alarms/LowVoltage': options,
                 '/Alarms/HighVoltage': options,
                 '/Alarms/LowTemperature': options,
                 '/Alarms/HighTemperature': options,
-                '/Dc/0/Power': options
             },
             'com.victronenergy.dcsource': {
-                '/Dc/0/Current': options,
+                '/Dc/0/Power': options,
                 '/Dc/0/Voltage': options,
+                '/Dc/0/Current': options,
                 '/History/EnergyOut': options,
                 '/Alarms/LowVoltage': options,
                 '/Alarms/HighVoltage': options,
                 '/Alarms/LowTemperature': options,
                 '/Alarms/HighTemperature': options,
-                '/Dc/0/Power': options
             }
         })
 
     def _get_value(self, serviceName, path, defaultValue=None):
         return self.monitor.get_value(serviceName, path, defaultValue)
 
+    def _safeadd(self, *args):
+        """Add values, treating None as 0. Returns None if all args are None."""
+        result = None
+        for arg in args:
+            if arg is not None:
+                if result is None:
+                    result = arg
+                else:
+                    result += arg
+        return result
+
+    def _get_battery(self):
+        """Get battery power and voltage from battery monitor or vebus."""
+        # First try battery monitor
+        batteries = self.monitor.get_service_list('com.victronenergy.battery')
+        if batteries:
+            service = next(iter(batteries.keys()))
+            p = self._get_value(service, '/Dc/0/Power')
+            v = self._get_value(service, '/Dc/0/Voltage')
+            if p is not None and v is not None and v > 0:
+                return float(p), float(v)
+        
+        # Fall back to vebus
+        vebusses = self.monitor.get_service_list('com.victronenergy.vebus')
+        if vebusses:
+            service = next(iter(vebusses.keys()))
+            v = self._get_value(service, '/Dc/0/Voltage')
+            i = self._get_value(service, '/Dc/0/Current')
+            if v is not None and i is not None and v > 0:
+                return float(v * i), float(v)
+        
+        return None, None
+
+    def _get_solar_power(self):
+        """Sum of all solar charger power (including load output)."""
+        total = 0.0
+        for s in self.monitor.get_service_list('com.victronenergy.solarcharger') or {}:
+            v = self._get_value(s, '/Dc/0/Voltage')
+            i = self._get_value(s, '/Dc/0/Current')
+            l = self._get_value(s, '/Load/I', 0) or 0
+            if v is not None and i is not None:
+                total += float(v) * (float(i) + float(l))
+        return total
+
+    def _get_charger_power(self):
+        """Sum of all AC charger power."""
+        total = 0.0
+        for s in self.monitor.get_service_list('com.victronenergy.charger') or {}:
+            v = self._get_value(s, '/Dc/0/Voltage')
+            i = self._get_value(s, '/Dc/0/Current')
+            if v is not None and i is not None:
+                total += float(v) * float(i)
+        return total
+
+    def _get_fuelcell_power(self):
+        """Sum of all fuel cell power."""
+        total = 0.0
+        for s in self.monitor.get_service_list('com.victronenergy.fuelcell') or {}:
+            v = self._get_value(s, '/Dc/0/Voltage')
+            i = self._get_value(s, '/Dc/0/Current')
+            if v is not None and i is not None:
+                total += float(v) * float(i)
+        return total
+
+    def _get_alternator_power(self):
+        """Sum of all alternator power."""
+        total = 0.0
+        for s in self.monitor.get_service_list('com.victronenergy.alternator') or {}:
+            p = self._get_value(s, '/Dc/0/Power')
+            if p is not None:
+                total += float(p)
+        return total
+
+    def _get_vebus_dc_power(self):
+        """Sum of all VE.Bus DC power (negative when inverting, positive when charging)."""
+        total = 0.0
+        for s in self.monitor.get_service_list('com.victronenergy.vebus') or {}:
+            v = self._get_value(s, '/Dc/0/Voltage')
+            i = self._get_value(s, '/Dc/0/Current')
+            if v is not None and i is not None:
+                total += float(v) * float(i)
+        return total
+
+    def _get_dcsource_power(self):
+        """Sum of all DC source power (e.g., wind generators)."""
+        total = 0.0
+        for s in self.monitor.get_service_list('com.victronenergy.dcsource') or {}:
+            p = self._get_value(s, '/Dc/0/Power')
+            if p is None:
+                v = self._get_value(s, '/Dc/0/Voltage')
+                i = self._get_value(s, '/Dc/0/Current')
+                if v is not None and i is not None:
+                    p = float(v) * float(i)
+                else:
+                    p = 0
+            total += float(p)
+        return total
+
+    def _get_dcload_power(self):
+        """Sum of all DC load power."""
+        total = 0.0
+        for s in self.monitor.get_service_list('com.victronenergy.dcload') or {}:
+            p = self._get_value(s, '/Dc/0/Power')
+            if p is None:
+                v = self._get_value(s, '/Dc/0/Voltage')
+                i = self._get_value(s, '/Dc/0/Current')
+                if v is not None and i is not None:
+                    p = float(v) * float(i)
+                else:
+                    p = 0
+            total += float(p)
+        return total
+
+    def _get_ac_consumption(self):
+        """DEPRECATED: VE.Bus DC power already accounts for AC consumption."""
+        return 0.0
+
     def update(self):
-        totalCurrent = 0
+        """Calculate DC system: Sources + VEBus_DC - Battery - Known DC Loads = Unknown DC System."""
+        # Get battery values
+        battery_power, battery_voltage = self._get_battery()
+        
+        if battery_power is None or battery_voltage is None:
+            # No valid battery data, fallback to simple aggregation
+            return self._update_simple_aggregation()
+
+        # Sum all DC sources
+        solar = self._get_solar_power()
+        chargers = self._get_charger_power()
+        fuel = self._get_fuelcell_power()
+        alternator = self._get_alternator_power()
+        wind = self._get_dcsource_power()
+        vebus_dc = self._get_vebus_dc_power()  # Can be negative when inverting
+        
+        # Sum known DC loads
+        dcloads = self._get_dcload_power()
+
+        # Calculate unknown DC system consumption
+        # DC_system = All_Sources + VEBus_DC - Battery - Known_DC_Loads
+        # (VEBus_DC is negative when inverting, so it reduces the total sources)
+        dc_system = (solar + chargers + fuel + alternator + wind + vebus_dc) - battery_power - dcloads
+
+        # Update values
+        self._local_values["/Dc/0/Voltage"] = battery_voltage
+        self._local_values["/Dc/0/Power"] = dc_system
+        self._local_values["/Dc/0/Current"] = dc_system / battery_voltage if battery_voltage > 0 else 0
+
+        # logger.info(
+        #     "DC System → solar=%.0fW chargers=%.0fW fuel=%.0fW alt=%.0fW wind=%.0fW vebus_dc=%.0fW dcloads=%.0fW battery=%.0fW ⇒ system=%.0fW",
+        #     solar, chargers, fuel, alternator, wind, vebus_dc, dcloads, battery_power, dc_system
+        # )
+        
+        return True
+
+    def _update_simple_aggregation(self):
+        """Fallback: simple aggregation of dcload and dcsource when no battery available."""
+        # Collect all dcload and dcsource services
+        dcloads = self.monitor.get_service_list('com.victronenergy.dcload')
+        dcsources = self.monitor.get_service_list('com.victronenergy.dcsource')
+
+        # Initialize aggregated values
+        totalCurrent = None
+        totalPower = None
         voltageSum = 0
         voltageCount = 0
-        totalPower = 0
         totalEnergyIn = 0
         totalEnergyOut = 0
         maxLowVoltageAlarm = ALARM_OK
@@ -115,42 +304,99 @@ class DCSystemService(SettableService):
         maxLowTempAlarm = ALARM_OK
         maxHighTempAlarm = ALARM_OK
 
-        dcServices = []
-        for serviceType in ['dcload', 'dcsource']:
-            for serviceName in self.monitor.get_service_list('com.victronenergy.' + serviceType):
-                dcServices.append(DCService(serviceName, serviceType))
-
-        for dcService in dcServices:
-            serviceName = dcService.name
-            current = self._get_value(serviceName, "/Dc/0/Current", 0)
-            voltage = self._get_value(serviceName, "/Dc/0/Voltage", 0)
-            power = self._get_value(serviceName, "/Dc/0/Power", voltage * current)
-            if dcService.type == 'dcload':
-                totalEnergyIn += self._get_value(serviceName, "/History/EnergyIn", 0)
-            else:
-                current = -current
-                power = -power
-                totalEnergyOut += self._get_value(serviceName, "/History/EnergyOut", 0)
-            totalCurrent += current
-            if voltage > VOLTAGE_DEADBAND:
+        # Process DC loads (positive = consuming power)
+        for serviceName in dcloads:
+            voltage = self._get_value(serviceName, "/Dc/0/Voltage")
+            current = self._get_value(serviceName, "/Dc/0/Current")
+            power = self._get_value(serviceName, "/Dc/0/Power")
+            
+            # Calculate power if not provided
+            if power is None and voltage is not None and current is not None:
+                power = voltage * current
+            
+            # Aggregate current and power
+            totalCurrent = self._safeadd(totalCurrent, current)
+            totalPower = self._safeadd(totalPower, power)
+            
+            # Aggregate voltage (only non-zero voltages)
+            if voltage is not None and voltage > VOLTAGE_DEADBAND:
                 voltageSum += voltage
                 voltageCount += 1
-            totalPower += power
+            
+            # Aggregate energy
+            energyIn = self._get_value(serviceName, "/History/EnergyIn", 0)
+            if energyIn is not None:
+                totalEnergyIn += energyIn
+            
+            # Aggregate alarms
+            maxLowVoltageAlarm = max(
+                self._get_value(serviceName, "/Alarms/LowVoltage", ALARM_OK), 
+                maxLowVoltageAlarm)
+            maxHighVoltageAlarm = max(
+                self._get_value(serviceName, "/Alarms/HighVoltage", ALARM_OK), 
+                maxHighVoltageAlarm)
+            maxLowTempAlarm = max(
+                self._get_value(serviceName, "/Alarms/LowTemperature", ALARM_OK), 
+                maxLowTempAlarm)
+            maxHighTempAlarm = max(
+                self._get_value(serviceName, "/Alarms/HighTemperature", ALARM_OK), 
+                maxHighTempAlarm)
 
-            maxLowVoltageAlarm = max(self._get_value(serviceName, "/Alarms/LowVoltage", ALARM_OK), maxLowVoltageAlarm)
-            maxHighVoltageAlarm = max(self._get_value(serviceName, "/Alarms/HighVoltage", ALARM_OK), maxHighVoltageAlarm)
-            maxLowTempAlarm = max(self._get_value(serviceName, "/Alarms/LowTemperature", ALARM_OK), maxLowTempAlarm)
-            maxHighTempAlarm = max(self._get_value(serviceName, "/Alarms/HighTemperature", ALARM_OK), maxHighTempAlarm)
+        # Process DC sources (negate current/power to make it negative = generating)
+        for serviceName in dcsources:
+            voltage = self._get_value(serviceName, "/Dc/0/Voltage")
+            current = self._get_value(serviceName, "/Dc/0/Current")
+            power = self._get_value(serviceName, "/Dc/0/Power")
+            
+            # Calculate power if not provided
+            if power is None and voltage is not None and current is not None:
+                power = voltage * current
+            
+            # Negate for sources (they provide power, so negative in system context)
+            if current is not None:
+                current = -current
+            if power is not None:
+                power = -power
+            
+            # Aggregate current and power
+            totalCurrent = self._safeadd(totalCurrent, current)
+            totalPower = self._safeadd(totalPower, power)
+            
+            # Aggregate voltage (only non-zero voltages)
+            if voltage is not None and voltage > VOLTAGE_DEADBAND:
+                voltageSum += voltage
+                voltageCount += 1
+            
+            # Aggregate energy
+            energyOut = self._get_value(serviceName, "/History/EnergyOut", 0)
+            if energyOut is not None:
+                totalEnergyOut += energyOut
+            
+            # Aggregate alarms
+            maxLowVoltageAlarm = max(
+                self._get_value(serviceName, "/Alarms/LowVoltage", ALARM_OK), 
+                maxLowVoltageAlarm)
+            maxHighVoltageAlarm = max(
+                self._get_value(serviceName, "/Alarms/HighVoltage", ALARM_OK), 
+                maxHighVoltageAlarm)
+            maxLowTempAlarm = max(
+                self._get_value(serviceName, "/Alarms/LowTemperature", ALARM_OK), 
+                maxLowTempAlarm)
+            maxHighTempAlarm = max(
+                self._get_value(serviceName, "/Alarms/HighTemperature", ALARM_OK), 
+                maxHighTempAlarm)
 
-        self._local_values["/Dc/0/Voltage"] = voltageSum/voltageCount if voltageCount > 0 else 0
-        self._local_values["/Dc/0/Current"] = totalCurrent
+        # Update local values
+        self._local_values["/Dc/0/Voltage"] = voltageSum / voltageCount if voltageCount > 0 else None
+        self._local_values["/Dc/0/Current"] = totalCurrent if totalCurrent is not None else 0
+        self._local_values["/Dc/0/Power"] = totalPower if totalPower is not None else 0
         self._local_values["/History/EnergyIn"] = totalEnergyIn
         self._local_values["/History/EnergyOut"] = totalEnergyOut
         self._local_values["/Alarms/LowVoltage"] = maxLowVoltageAlarm
         self._local_values["/Alarms/HighVoltage"] = maxHighVoltageAlarm
         self._local_values["/Alarms/LowTemperature"] = maxLowTempAlarm
         self._local_values["/Alarms/HighTemperature"] = maxHighTempAlarm
-        self._local_values["/Dc/0/Power"] = totalPower
+        
         return True
 
     def publish(self):
